@@ -1,0 +1,11 @@
+.DS_Store
+/.build/
+/.swiftpm/
+xcuserdata/
+*.provisionprofile
+*.zip
+
+# Agent worktrees and local agent state
+.claude/worktrees/
+.claude/settings.local.json
+.claude/.cc-writes/
