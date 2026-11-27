@@ -1,6 +1,6 @@
 # Pico Xcode Bridge
 
-A small menu-bar app that lets [Pico](https://picoai.app) use Xcode's MCP tools (build, test, previews, documentation search, project files). It runs Xcode's `xcrun mcpbridge` and serves it over MCP's streamable HTTP on `127.0.0.1`, where Pico can reach it.
+A small menu-bar app that lets Pico use Xcode's MCP tools (build, test, previews, documentation search, project files). It runs Xcode's `xcrun mcpbridge` and serves it over MCP's streamable HTTP on `127.0.0.1`, where Pico can reach it.
 
 ## Why it exists
 
@@ -15,8 +15,6 @@ Pico (sandboxed) --HTTP 127.0.0.1:<port>/mcp + bearer token--> Pico Xcode Bridge
                                                                   v
                                                                Xcode (XPC)
 ```
-
-The design and the spike's measurements are in `xcode-bridge-design.md` in the PicoCore repository.
 
 ## Requirements
 
@@ -164,7 +162,7 @@ These need signing assets that weren't on the build Mac:
 - Xcode's **Always** approval of a Developer ID build.
 - The app group shared between this unsandboxed app and sandboxed Pico.
 
-If the registered group turns out to be a problem, the design's fallback is a team-prefixed group, `TPKP4XK352.com.starlingprotocol.xcode-bridge`. That needs no profile. The bridge would write its port and token to a file in that group's container.
+If the registered group turns out to be a problem, the fallback is a team-prefixed group, `TPKP4XK352.com.starlingprotocol.xcode-bridge`. That needs no profile. The bridge would write its port and token to a file in that group's container.
 
 ## Layout
 

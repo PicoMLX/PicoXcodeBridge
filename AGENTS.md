@@ -6,7 +6,7 @@ These are the conventions for this repository, for people and coding agents. `RE
 
 - It is a pass-through proxy: MCP streamable HTTP on `127.0.0.1`, with one `xcrun mcpbridge` child per session.
 - It parses only the fields it needs to route a message: `id`, `method`, the progress token and the cancelled request's id. It forwards the original bytes.
-- **It never interprets, rewrites or filters tool calls or their results.** The one planned exception is phase 2 of the design: inlining files under `ActionArtifacts`. It needs its own design note before it lands.
+- **It never interprets, rewrites or filters tool calls or their results.** The one planned exception: replacing paths under Xcode's `ActionArtifacts` folder, which a sandboxed client can't read, with the files' contents. It needs its own design note before it lands.
 
 ## Code
 
