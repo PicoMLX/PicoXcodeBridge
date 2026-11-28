@@ -60,7 +60,7 @@ var waitingAsk: Any?
     case "ping":
         result(id, [:])
     case "tools/list":
-        let names = ["echo", "slow", "notify", "ask", "big", "hang", "crash"]
+        let names = ["echo", "slow", "notify", "ask", "big", "hang", "crash", "identity"]
         result(id, ["tools": names.map { ["name": $0, "inputSchema": ["type": "object"]] }])
     case "tools/call":
         let arguments = params["arguments"] ?? [String: Any]()
@@ -68,6 +68,10 @@ var waitingAsk: Any?
         switch params["name"] as? String {
         case "echo":
             result(id, text(json(arguments)))
+        case "identity":
+            result(id, text(json(["arguments": Array(ProcessInfo.processInfo.arguments.dropFirst()),
+                                  "marker": ProcessInfo.processInfo.environment["PROFILE_MARKER"] ?? "",
+                                  "path": ProcessInfo.processInfo.environment["PATH"] ?? ""])))
         case "slow":
             for step in 1...3 {
                 if let token {
@@ -99,6 +103,8 @@ var waitingAsk: Any?
     }
 }
 
+let ignoresEOF = ProcessInfo.processInfo.arguments.contains("--ignore-eof")
+if ignoresEOF { signal(SIGTERM, SIG_IGN) }
 FileHandle.standardError.write(Data("fake-mcp-server: started\n".utf8))
 var buffer = Data()
 while case let chunk = FileHandle.standardInput.availableData, !chunk.isEmpty {
@@ -111,4 +117,5 @@ while case let chunk = FileHandle.standardInput.availableData, !chunk.isEmpty {
         }
     }
 }
+if ignoresEOF { while true { Thread.sleep(forTimeInterval: 0.1) } }
 exit(0)
