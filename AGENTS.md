@@ -13,7 +13,7 @@ These are the conventions for this repository, for people and coding agents. `RE
 - **Concrete types.** Don't add a protocol for a single implementation, a dependency-injection layer, or an abstraction "for testing". Tests run the real types against `FakeMCPServer`.
 - **The fewest files.**
   - The core is three files: `BridgeServer.swift`, `MCPSession.swift` and `Discovery.swift`.
-  - The app is one: `PicoXcodeBridgeApp.swift`.
+  - The app is one: `App/PicoXcodeBridgeApp.swift`, the only source file of the app target in `PicoXcodeBridge.xcodeproj`. Code that isn't menu-bar UI belongs in the package, where the tests reach it.
   - Add a file only when one holds unrelated things or grows hard to read, not for each type.
 - **Swift 6 language mode, with strict concurrency.**
   - Prefer actors and `Mutex` over locks.
@@ -43,8 +43,11 @@ PICO_XCODE_BRIDGE_INTEGRATION=1 swift test --filter XcodeIntegrationTests
 ```
 
 ```bash
-Scripts/build-app.sh
+xcodebuild -project PicoXcodeBridge.xcodeproj -scheme "Pico Xcode Bridge" -configuration Release build CODE_SIGNING_ALLOWED=NO
 ```
+
+- **The Xcode project is the one way to build the app.** Its target holds the `Info.plist`, the entitlements, the version and the signing settings. Don't add a second one, such as a script that assembles the `.app`.
+- **Check the app with unsigned builds**, as above. Signing, archives and notarization are for whoever releases the app, in Xcode.
 
 In a sandboxed agent shell, SwiftPM may need its own sandbox off (`--disable-sandbox`) or the command run outside the agent's sandbox.
 
@@ -52,4 +55,4 @@ In a sandboxed agent shell, SwiftPM may need its own sandbox off (`--disable-san
 
 - Keep `main` clean in the primary checkout. Do feature work on a branch in a worktree under `.claude/worktrees/`, which `.gitignore` excludes.
 - End commit messages written with a coding agent with the attribution line that agent's instructions give.
-- Commit `Package.resolved`: this is an app, and its dependency versions are pinned.
+- Commit both `Package.resolved` files and keep them the same: the package's, and Xcode's in `PicoXcodeBridge.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/`. This is an app, and its dependency versions are pinned.

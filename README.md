@@ -101,56 +101,38 @@ One integration test runs against the real `xcrun mcpbridge`. It initializes and
 PICO_XCODE_BRIDGE_INTEGRATION=1 swift test --filter XcodeIntegrationTests
 ```
 
-To build and sign the app bundle into `.build/app/Pico Xcode Bridge.app`:
+## The Xcode project
+
+The menu-bar app is the **Pico Xcode Bridge** target in `PicoXcodeBridge.xcodeproj`. Its source, `Info.plist` and entitlements are in `App/`. It links the package's `XcodeBridgeCore` library through a local package reference, so all the bridge code and its tests stay in the package.
+
+To run the app, open `PicoXcodeBridge.xcodeproj` and choose **Product › Run**. To build it from Terminal without signing:
 
 ```bash
-Scripts/build-app.sh
+xcodebuild -project PicoXcodeBridge.xcodeproj -scheme "Pico Xcode Bridge" -configuration Release build CODE_SIGNING_ALLOWED=NO
 ```
 
-For development, `PICO_XCODE_BRIDGE_SUITE=<name>` makes the app write to another defaults suite instead of Pico's group, for example to run a second copy without touching Pico's settings.
+For development, `PICO_XCODE_BRIDGE_SUITE=<name>` makes the app write to another defaults suite instead of Pico's group, for example to run a second copy without touching Pico's settings. The scheme defines it, turned off; turn it on under **Product › Scheme › Edit Scheme › Run › Arguments**.
 
-## Signing and release
+The package and the project each pin the dependency versions: `Package.resolved` for `swift build` and `swift test`, and `PicoXcodeBridge.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved` for Xcode. Keep the two the same.
 
-`Scripts/build-app.sh` signs with the hardened runtime. It picks the first identity it finds:
-1. a Developer ID Application identity;
-2. an Apple Development identity;
-3. ad hoc signing.
+## Release
 
-`SIGN_IDENTITY` overrides the choice.
+The target signs automatically with team TPKP4XK352 and the hardened runtime. It isn't sandboxed, and its entitlements hold only the app group `group.com.starlingprotocol.pico`.
 
-**Without a profile, Pico can't find the bridge.** Without a provisioning profile, the app has no entitlements. Its defaults then go to `~/Library/Preferences` instead of the group container. The bridge works over HTTP, but Pico can't discover it.
-
-### One-time setup in the developer portal (team TPKP4XK352)
-
-`group.` app group identifiers are registered, so on macOS the app-group entitlement must be backed by a provisioning profile that lists the group.
-
-1. **App ID.** Under *Identifiers*, register an explicit App ID, `com.starlingprotocol.pico-xcode-bridge`. Enable *App Groups* and assign `group.com.starlingprotocol.pico`, the group Pico Server already uses.
-2. **Developer ID profile.** Under *Profiles*, create a *Developer ID* distribution profile for that App ID with the team's Developer ID Application certificate. Download it.
-3. **Development profile (optional).** For development builds that use the group, create a *macOS App Development* profile for the same App ID that includes this Mac.
-
-### Release build
+1. In **Xcode › Settings › Accounts**, sign in with an Apple Account on team TPKP4XK352.
+2. Open `PicoXcodeBridge.xcodeproj`. If this is a new version, set **Version** and **Build** on the target's **General** tab.
+3. Choose the **Pico Xcode Bridge** scheme and **My Mac** as the destination, then **Product › Archive**.
+4. In the Organizer, select the archive and click **Distribute App**. Choose **Direct Distribution**, then **Distribute**. Xcode signs the app with Developer ID, uploads it to Apple's notary service, and staples the ticket once Apple accepts it.
+5. When notarization is done, select the archive and click **Export Notarized App**.
+6. To attach the app to a GitHub release, zip it first:
 
 ```bash
-PROVISIONING_PROFILE=~/Downloads/PicoXcodeBridge_DeveloperID.provisionprofile \
-SIGN_IDENTITY="Developer ID Application: <Name> (TPKP4XK352)" \
-Scripts/build-app.sh release
+ditto -c -k --keepParent "Pico Xcode Bridge.app" PicoXcodeBridge.zip
 ```
 
-With a profile, the script embeds it and signs with `Resources/PicoXcodeBridge.entitlements`. That file holds the app group, plus the application and team identifiers that tie the profile to the signature.
+**Xcode sets up the signing assets.** The first time Xcode signs the app for the team, on the first Run or the first archive, it registers the App ID `com.starlingprotocol.pico-xcode-bridge` with the app group and creates the provisioning profiles that list the group. Distribute App signs with a cloud-managed Developer ID certificate, so there's no certificate to install. If Xcode says the account can't use one, sign in as the team's Account Holder, or ask the Account Holder for access to cloud-managed Developer ID certificates.
 
-### Notarize and staple
-
-```bash
-ditto -c -k --keepParent ".build/app/Pico Xcode Bridge.app" PicoXcodeBridge.zip
-```
-
-```bash
-xcrun notarytool submit PicoXcodeBridge.zip --keychain-profile <profile> --wait
-```
-
-```bash
-xcrun stapler staple ".build/app/Pico Xcode Bridge.app"
-```
+**Builds without the team's profile can't share the app group.** A build signed ad hoc or not at all, such as the `CODE_SIGNING_ALLOWED=NO` build above, has no app-group entitlement. Its defaults go to `~/Library/Preferences` instead of the group container. The bridge works over HTTP, but Pico can't discover it.
 
 ### Keep the bundle identifier
 
@@ -158,8 +140,9 @@ Xcode records the approved agent by its signing identifier (`com.starlingprotoco
 
 ### Not tested yet
 
-These need signing assets that weren't on the build Mac:
-- Xcode's **Always** approval of a Developer ID build.
+These need the team's signing, which the repository's own checks don't use:
+- An archive signed with Developer ID, notarized and stapled.
+- Xcode's **Always** approval of that build.
 - The app group shared between this unsandboxed app and sandboxed Pico.
 
 If the registered group turns out to be a problem, the fallback is a team-prefixed group, `TPKP4XK352.com.starlingprotocol.xcode-bridge`. That needs no profile. The bridge would write its port and token to a file in that group's container.
@@ -167,17 +150,18 @@ If the registered group turns out to be a problem, the fallback is a team-prefix
 ## Layout
 
 ```
-Package.swift
+Package.swift                    the package: XcodeBridgeCore, FakeMCPServer and the tests
 Sources/XcodeBridgeCore/
   BridgeServer.swift   HTTP: routing, the Host, Origin and token checks, SSE responses, ports
   MCPSession.swift     sessions, the child process, line framing, JSON-RPC routing fields
   Discovery.swift      the app-group contract with Pico and the token
-Sources/PicoXcodeBridge/
-  PicoXcodeBridgeApp.swift   the menu-bar app
 Tests/FakeMCPServer/main.swift   the stdio MCP server the tests launch
 Tests/XcodeBridgeCoreTests/      Swift Testing tests
-Resources/                       Info.plist and the entitlements
-Scripts/build-app.sh             builds and signs the .app
+PicoXcodeBridge.xcodeproj        the app target, which links XcodeBridgeCore
+App/
+  PicoXcodeBridgeApp.swift       the menu-bar app
+  Info.plist
+  PicoXcodeBridge.entitlements   the app group
 ```
 
 ## License
