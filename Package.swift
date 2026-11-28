@@ -2,16 +2,17 @@
 import PackageDescription
 
 // XcodeBridgeCore is the whole bridge: the HTTP side, the sessions and their `xcrun mcpbridge`
-// children, and the discovery contract. The PicoXcodeBridge executable is only the menu-bar shell;
-// Scripts/build-app.sh wraps it in an .app bundle and signs it. FakeMCPServer is a stdio MCP server
-// the tests launch in place of `xcrun mcpbridge`, so the tests never need Xcode.
+// children, and the discovery contract. The menu-bar app is the "Pico Xcode Bridge" target in
+// PicoXcodeBridge.xcodeproj, which links this library; Xcode archives, signs and notarizes it.
+// FakeMCPServer is a stdio MCP server the tests launch in place of `xcrun mcpbridge`, so the tests
+// never need Xcode.
 let package = Package(
     name: "PicoXcodeBridge",
     // Xcode's `mcpbridge` binary is built for macOS 26.0 (its LC_BUILD_VERSION minos), so the
     // bridge can't do anything useful on an older system.
     platforms: [.macOS(.v26)],
     products: [
-        .executable(name: "PicoXcodeBridge", targets: ["PicoXcodeBridge"]),
+        .library(name: "XcodeBridgeCore", targets: ["XcodeBridgeCore"]),
     ],
     dependencies: [
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.29.0"),
@@ -31,10 +32,6 @@ let package = Package(
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
             ]
-        ),
-        .executableTarget(
-            name: "PicoXcodeBridge",
-            dependencies: ["XcodeBridgeCore"]
         ),
         .executableTarget(
             name: "FakeMCPServer",
