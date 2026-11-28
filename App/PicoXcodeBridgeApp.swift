@@ -23,8 +23,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var terminationSignal: (any DispatchSourceSignal)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Info.plist sets LSUIElement; this covers `swift run`, which has no Info.plist.
-        NSApp.setActivationPolicy(.accessory)
         // SIGTERM (`killall`, launchd) would skip applicationWillTerminate and leave the
         // published status at "running"; quit through AppKit instead.
         signal(SIGTERM, SIG_IGN)
