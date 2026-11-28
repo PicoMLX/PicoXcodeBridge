@@ -21,6 +21,7 @@ struct PicoXcodeBridgeApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let controller = BridgeController()
     private var terminationSignal: (any DispatchSourceSignal)?
+    private var isTerminating = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // SIGTERM (`killall`, launchd) would skip applicationWillTerminate and leave the
@@ -33,8 +34,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.start()
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !isTerminating else { return .terminateLater }
+        isTerminating = true
+        Task {
+            await controller.stop()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
-        // The children see their stdin close when the bridge exits, and stop.
         controller.publishStopped()
     }
 }
@@ -48,6 +58,7 @@ struct BridgeMenu: View {
         Text(controller.xcodeDescription)
         Text(controller.clientDescription)
         Text(controller.listeningDescription)
+        Text(controller.profilesDescription)
         Divider()
         Toggle("Open at Login", isOn: Binding(
             get: { controller.launchesAtLogin },
@@ -56,6 +67,9 @@ struct BridgeMenu: View {
         if controller.loginItemNeedsApproval {
             Button("Allow in Login Items Settings…") { SMAppService.openSystemSettingsLoginItems() }
         }
+        Button("Open Server Profiles…") { controller.openProfiles() }
+        Button("Reload Server Profiles") { controller.reloadProfiles() }
+            .disabled(controller.isReloading)
         Button("Reset Token") { controller.resetToken() }
         Button("Open Logs") { controller.openLogs() }
         if let message = controller.lastError {
@@ -79,6 +93,23 @@ final class BridgeController {
     private(set) var serverFailed = false
     private(set) var lastError: String?
     private(set) var loginItemStatus = SMAppService.mainApp.status
+    private(set) var isReloading = false
+    private var profiles: [BridgeProfile] = []
+    private var serverTask: Task<Void, Never>?
+    private var reloadTask: Task<Void, Never>?
+    private var isStopping = false
+
+    private var profilesURL: URL {
+        if let path = ProcessInfo.processInfo.environment["PICO_MCP_BRIDGE_CONFIG"] {
+            return URL(filePath: path)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: "Library/Application Support/PicoXcodeBridge/profiles.json")
+    }
+
+    var profilesDescription: String {
+        profiles.isEmpty ? "Xcode profile enabled" : "Xcode and \(profiles.count) other server profiles enabled"
+    }
 
     /// PICO_XCODE_BRIDGE_SUITE points a development build at other defaults than Pico's group.
     private let discovery = Discovery(suiteName: ProcessInfo.processInfo.environment["PICO_XCODE_BRIDGE_SUITE"] ?? Discovery.appGroup)
@@ -112,8 +143,19 @@ final class BridgeController {
     var loginItemNeedsApproval: Bool { loginItemStatus == .requiresApproval }
 
     func start() {
+        do { profiles = try BridgeProfileConfiguration.load(from: profilesURL) }
+        catch { lastError = "Server profiles: \(error.localizedDescription)" }
+        startServer()
+        Task { await monitorXcode() }
+        addLoginItemOnFirstLaunch()
+    }
+
+    private func startServer() {
+        serverFailed = false
+        var configuration = BridgeConfiguration(preferredPort: discovery.lastPort)
+        configuration.profiles = profiles
         let server = BridgeServer(
-            configuration: BridgeConfiguration(preferredPort: discovery.lastPort),
+            configuration: configuration,
             token: discovery.token(),
             onSessionCountChange: { [weak self] _ in
                 // These tasks can run out of order, so each reads the current count.
@@ -124,23 +166,71 @@ final class BridgeController {
             }
         )
         self.server = server
-        Task {
+        let publishedProfiles = profiles
+        serverTask = Task {
             do {
                 try await server.run { port in
                     await MainActor.run {
                         self.port = port
                         self.discovery.publish(port: port)
                         self.discovery.publish(status: .running)
+                        self.discovery.publish(profiles: publishedProfiles)
                     }
                 }
+            } catch is CancellationError {
+                // Reload and application shutdown deliberately stop the previous server.
             } catch {
                 serverFailed = true
                 lastError = "Couldn't listen: \(error.localizedDescription)"
                 discovery.publish(status: .failed)
             }
         }
-        Task { await monitorXcode() }
-        addLoginItemOnFirstLaunch()
+    }
+
+    /// Creates an opt-in example file; editing this local file is the only way to configure commands.
+    func openProfiles() {
+        do {
+            try FileManager.default.createDirectory(at: profilesURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: profilesURL.path) {
+                try BridgeProfileConfiguration.exampleData().write(to: profilesURL, options: .atomic)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: profilesURL.path)
+            }
+            if !NSWorkspace.shared.open(profilesURL) {
+                NSWorkspace.shared.activateFileViewerSelecting([profilesURL])
+            }
+        } catch { lastError = "Server profiles: \(error.localizedDescription)" }
+    }
+
+    func reloadProfiles() {
+        guard !isReloading else { return }
+        let updated: [BridgeProfile]
+        do { updated = try BridgeProfileConfiguration.load(from: profilesURL) }
+        catch {
+            lastError = "Server profiles: \(error.localizedDescription)"
+            return
+        }
+        isReloading = true
+        discovery.publish(status: .stopped)
+        let previous = serverTask
+        previous?.cancel()
+        reloadTask = Task {
+            await previous?.value
+            guard !isStopping else { return }
+            profiles = updated
+            port = nil
+            lastError = nil
+            startServer()
+            isReloading = false
+        }
+    }
+
+    func stop() async {
+        isStopping = true
+        discovery.publish(status: .stopped)
+        let running = serverTask
+        running?.cancel()
+        await running?.value
+        await reloadTask?.value
     }
 
     func publishStopped() {

@@ -161,6 +161,37 @@ private final class StderrTail: Sendable {
     }
 }
 
+/// Process exit is independent of stdout EOF: a descendant may keep a pipe open. Multiple
+/// shutdown waiters must observe the same status without competing for an AsyncStream element.
+private final class ChildExit: Sendable {
+    private struct State {
+        var status: Int32?
+        var waiters: [CheckedContinuation<Int32, Never>] = []
+    }
+    private let state = Mutex(State())
+
+    func finish(_ status: Int32) {
+        let waiters = state.withLock { state in
+            state.status = status
+            let waiters = state.waiters
+            state.waiters.removeAll()
+            return waiters
+        }
+        for waiter in waiters { waiter.resume(returning: status) }
+    }
+
+    func value() async -> Int32 {
+        await withCheckedContinuation { continuation in
+            let status = state.withLock { state -> Int32? in
+                if let status = state.status { return status }
+                state.waiters.append(continuation)
+                return nil
+            }
+            if let status { continuation.resume(returning: status) }
+        }
+    }
+}
+
 /// One `xcrun mcpbridge` process (or, in tests, a fake) with line-delimited JSON-RPC on its
 /// stdin and stdout.
 final class StdioChild: @unchecked Sendable {
@@ -171,7 +202,7 @@ final class StdioChild: @unchecked Sendable {
     private let process: Process
     private let stdin: FileHandle
     private let writeQueue = DispatchQueue(label: "com.starlingprotocol.pico-xcode-bridge.stdin")
-    private let exit: AsyncStream<Int32>
+    private let exit = ChildExit()
     private let stderrClosed: AsyncStream<Void>
     private let stderrTail = StderrTail()
 
@@ -191,17 +222,15 @@ final class StdioChild: @unchecked Sendable {
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
 
-        let (exit, exitContinuation) = AsyncStream<Int32>.makeStream()
+        let exit = self.exit
         process.terminationHandler = { process in
-            exitContinuation.yield(process.terminationStatus)
-            exitContinuation.finish()
+            exit.finish(process.terminationStatus)
         }
         try process.run()
 
         self.process = process
         self.pid = process.processIdentifier
         self.stdin = stdinPipe.fileHandleForWriting
-        self.exit = exit
 
         let (lines, linesContinuation) = AsyncStream<Data>.makeStream()
         self.lines = lines
@@ -248,15 +277,22 @@ final class StdioChild: @unchecked Sendable {
     /// still running two seconds later.
     func terminate() {
         writeQueue.async { [stdin] in try? stdin.close() }
-        writeQueue.asyncAfter(deadline: .now() + 2) { [self] in
+        // A blocked stdin write must not hold up termination escalation.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2) { [self] in
             if process.isRunning { process.terminate() }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 4) { [self] in
+            // The user has ended this server session. A child that ignores SIGTERM must not
+            // survive token revocation or prevent the companion from quitting.
+            if process.isRunning { _ = kill(pid, SIGKILL) }
         }
     }
 
-    /// Waits for the process to exit and returns its status. Call it once.
+    func waitForTermination() async { _ = await exit.value() }
+
+    /// The output pump also waits briefly for stderr so errors can quote the child's last words.
     func waitForExit() async -> Int32 {
-        var status = Int32(-1)
-        for await exitStatus in exit { status = exitStatus }
+        let status = await exit.value()
         // Give the stderr reader a moment to catch up, so an error message can quote the child's
         // last words, but don't wait on a grandchild that kept stderr open.
         await withTaskGroup { [stderrClosed] group in
@@ -278,6 +314,8 @@ final class StdioChild: @unchecked Sendable {
 actor MCPSession {
     nonisolated let id: String
     nonisolated let childPID: Int32
+    nonisolated let profileID: String
+    private let profileName: String
     private let child: StdioChild
     private let heartbeatInterval: Duration
     private let onExit: @Sendable (String) async -> Void
@@ -299,10 +337,13 @@ actor MCPSession {
     private(set) var lastActivity = ContinuousClock.now
     private(set) var isClosed = false
     private var heartbeat: Task<Void, Never>?
+    private var pumpTask: Task<Void, Never>?
 
-    init(id: String, child: StdioChild, heartbeatInterval: Duration, onExit: @escaping @Sendable (String) async -> Void) {
+    init(id: String, child: StdioChild, profile: BridgeProfile, heartbeatInterval: Duration, onExit: @escaping @Sendable (String) async -> Void) {
         self.id = id
         self.childPID = child.pid
+        self.profileID = profile.id
+        self.profileName = profile.name
         self.child = child
         self.heartbeatInterval = heartbeatInterval
         self.onExit = onExit
@@ -310,7 +351,7 @@ actor MCPSession {
 
     /// Starts reading the child's output and sending heartbeats.
     func start() {
-        Task { await pump() }
+        pumpTask = Task { await pump() }
         heartbeat = Task { [weak self, heartbeatInterval] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: heartbeatInterval)
@@ -385,7 +426,10 @@ actor MCPSession {
         serverStream?.continuation.finish()
         serverStream = nil
         child.terminate()
+        pumpTask?.cancel()
     }
+
+    func waitForTermination() async { await child.waitForTermination() }
 
     // MARK: Child output
 
@@ -439,7 +483,7 @@ actor MCPSession {
 
     private func childExited(status: Int32) {
         guard !isClosed else { return }
-        var reason = "Xcode's mcpbridge exited with status \(status)"
+        var reason = "\(profileName) MCP server exited with status \(status)"
         if let detail = child.lastStderrLine { reason += ": \(detail)" }
         log.error("session \(self.id, privacy: .public): \(reason, privacy: .public)")
         for (requestID, entry) in pending {
@@ -475,6 +519,8 @@ actor MCPSession {
 /// The live sessions, by `Mcp-Session-Id`.
 actor SessionStore {
     private var sessions: [String: MCPSession] = [:]
+    private var terminating: [String: MCPSession] = [:]
+    private var isStopping = false
     private let configuration: BridgeConfiguration
     private let onCountChange: @Sendable (Int) -> Void
 
@@ -490,7 +536,8 @@ actor SessionStore {
 
     /// Starts a child process for a new session. At the session limit it stops the least recently
     /// used session that has no open streams, or fails when every session is busy.
-    func create() async throws(CreateError) -> MCPSession {
+    func create(profile: BridgeProfile) async throws(CreateError) -> MCPSession {
+        guard !isStopping else { throw .tooManySessions }
         if sessions.count >= configuration.maxSessions {
             var candidate: (session: MCPSession, lastActivity: ContinuousClock.Instant)?
             for session in sessions.values where await !session.hasOpenStreams {
@@ -500,41 +547,66 @@ actor SessionStore {
             guard let candidate else { throw .tooManySessions }
             await remove(candidate.session.id)?.close()
         }
+        // BridgeConfiguration.childEnvironment historically replaces Xcode's entire environment.
+        // Preserve that contract; additional profiles use documented overrides of the inherited one.
+        let environment = profile.id == "xcode" ? profile.environment
+            : profile.environment.map { ProcessInfo.processInfo.environment.merging($0) { _, value in value } }
+        guard !isStopping else { throw .tooManySessions }
         let child: StdioChild
         do {
             child = try StdioChild(
-                executable: configuration.childExecutable,
-                arguments: configuration.childArguments,
-                environment: configuration.childEnvironment
+                executable: URL(filePath: profile.executable),
+                arguments: profile.arguments,
+                environment: environment
             )
         } catch {
             throw .launchFailed(error.localizedDescription)
         }
-        let session = MCPSession(id: UUID().uuidString, child: child, heartbeatInterval: configuration.heartbeatInterval) { [weak self] id in
-            await self?.remove(id)
+        let session = MCPSession(id: UUID().uuidString, child: child, profile: profile, heartbeatInterval: configuration.heartbeatInterval) { [weak self] id in
+            await self?.childExited(id)
         }
-        await session.start()
         sessions[session.id] = session
+        await session.start()
         log.info("session \(session.id, privacy: .public): started child \(child.pid)")
         onCountChange(sessions.count)
         return session
     }
 
-    func session(_ id: String) -> MCPSession? { sessions[id] }
+    func session(_ id: String, profileID: String = "xcode") -> MCPSession? {
+        guard let session = sessions[id], session.profileID == profileID else { return nil }
+        return session
+    }
 
     @discardableResult
-    func remove(_ id: String) -> MCPSession? {
-        guard let session = sessions.removeValue(forKey: id) else { return nil }
+    func remove(_ id: String, profileID: String? = nil) -> MCPSession? {
+        guard let session = sessions[id], profileID == nil || session.profileID == profileID else { return nil }
+        sessions.removeValue(forKey: id)
+        terminating[id] = session
         log.info("session \(id, privacy: .public): ended")
         onCountChange(sessions.count)
         return session
     }
 
+    private func childExited(_ id: String) {
+        if sessions.removeValue(forKey: id) != nil { onCountChange(sessions.count) }
+        terminating.removeValue(forKey: id)
+    }
+
     func closeAll() async {
-        let all = sessions.values
+        let all = Array(sessions.values) + Array(terminating.values)
         sessions.removeAll()
+        for session in all { terminating[session.id] = session }
         for session in all { await session.close() }
-        if !all.isEmpty { onCountChange(0) }
+        if !all.isEmpty { onCountChange(sessions.count) }
+        await withTaskGroup { group in
+            for session in all { group.addTask { await session.waitForTermination() } }
+        }
+        for session in all { terminating.removeValue(forKey: session.id) }
+    }
+
+    func shutdown() async {
+        isStopping = true
+        await closeAll()
     }
 
     /// Stops sessions that have no open stream and no activity for `idleTimeout`.

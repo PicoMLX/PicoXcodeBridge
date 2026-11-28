@@ -16,6 +16,21 @@ public struct BridgeConfiguration: Sendable {
     public var childArguments = ["mcpbridge"]
     /// `nil` passes the bridge's own environment, which `xcrun` uses to pick the Xcode.
     public var childEnvironment: [String: String]?
+    /// Additional, locally configured stdio servers. The legacy /mcp route always remains Xcode.
+    public var profiles: [BridgeProfile] = []
+
+    var enabledProfiles: [BridgeProfile] {
+        // Configuration loaded from disk is validated too; checking here protects other callers.
+        (try? BridgeProfileConfiguration(profiles: profiles).validatedProfiles()) ?? []
+    }
+
+    func profile(for path: String) -> BridgeProfile? {
+        if path == "/mcp" || path == "/mcp/xcode" {
+            return BridgeProfile(id: "xcode", name: "Xcode", executable: childExecutable.path,
+                                 arguments: childArguments, environment: childEnvironment)
+        }
+        return enabledProfiles.first { $0.path == path }
+    }
     /// A session with no open stream is stopped after this long without a request.
     public var idleTimeout: Duration = .seconds(30 * 60)
     /// How often open SSE streams get a comment line, to keep clients' idle timers from firing.
@@ -159,17 +174,17 @@ public final class BridgeServer: Sendable {
                 } onCancel: { [sessions] in
                     Task {
                         // Open SSE streams would otherwise hold up the shutdown.
-                        await sessions.closeAll()
+                        await sessions.shutdown()
                         await group.triggerGracefulShutdown()
                     }
                 }
-                await sessions.closeAll()
+                await sessions.shutdown()
                 return
             } catch let error as IOError where error.errnoCode == EADDRINUSE && port == nil {
                 lastError = error
                 continue
             } catch {
-                await sessions.closeAll()
+                await sessions.shutdown()
                 throw error
             }
         }
@@ -197,13 +212,13 @@ public final class BridgeServer: Sendable {
                 return response
             }
         }
-        guard request.uri.path == "/mcp" else {
-            return Self.error(.notFound, "Not found. The MCP endpoint is /mcp.")
+        guard let profile = configuration.profile(for: request.uri.path) else {
+            return Self.error(.notFound, "No configured MCP profile at this path.")
         }
         switch request.method {
-        case .post: return await post(request)
-        case .get: return await get(request)
-        case .delete: return await delete(request)
+        case .post: return await post(request, profile: profile)
+        case .get: return await get(request, profileID: profile.id)
+        case .delete: return await delete(request, profileID: profile.id)
         default:
             var response = Self.error(.methodNotAllowed, "Use GET, POST or DELETE.")
             response.headers[.allow] = "GET, POST, DELETE"
@@ -211,7 +226,7 @@ public final class BridgeServer: Sendable {
         }
     }
 
-    private func post(_ request: Request) async -> Response {
+    private func post(_ request: Request, profile: BridgeProfile) async -> Response {
         var request = request
         let body: ByteBuffer
         do {
@@ -232,13 +247,13 @@ public final class BridgeServer: Sendable {
         if case .request(let id) = message.kind, message.method == "initialize" {
             let session: MCPSession
             do {
-                session = try await sessions.create()
+                session = try await sessions.create(profile: profile)
             } catch {
                 switch error {
                 case .tooManySessions:
                     return Self.error(.serviceUnavailable, "Too many open sessions. Close one and try again.", id: id)
                 case .launchFailed(let reason):
-                    return Self.error(.badGateway, "Couldn't start xcrun mcpbridge: \(reason)", id: id, code: BridgeErrorCode.xcodeUnavailable)
+                    return Self.error(.badGateway, "Couldn't start \(profile.name): \(reason)", id: id, code: BridgeErrorCode.xcodeUnavailable)
                 }
             }
             return await stream(for: line, id: id, progressToken: message.progressToken, in: session)
@@ -247,7 +262,7 @@ public final class BridgeServer: Sendable {
         guard let sessionID = request.headers[.mcpSessionID] else {
             return Self.error(.badRequest, "The Mcp-Session-Id header is required. Send initialize first.")
         }
-        guard let session = await sessions.session(sessionID) else {
+        guard let session = await sessions.session(sessionID, profileID: profile.id) else {
             return Self.sessionNotFound
         }
         switch message.kind {
@@ -270,21 +285,21 @@ public final class BridgeServer: Sendable {
         }
     }
 
-    private func get(_ request: Request) async -> Response {
+    private func get(_ request: Request, profileID: String) async -> Response {
         guard let sessionID = request.headers[.mcpSessionID] else {
             return Self.error(.badRequest, "The Mcp-Session-Id header is required.")
         }
-        guard let session = await sessions.session(sessionID), let stream = await session.openServerStream() else {
+        guard let session = await sessions.session(sessionID, profileID: profileID), let stream = await session.openServerStream() else {
             return Self.sessionNotFound
         }
         return Self.eventStream(stream, sessionID: sessionID)
     }
 
-    private func delete(_ request: Request) async -> Response {
+    private func delete(_ request: Request, profileID: String) async -> Response {
         guard let sessionID = request.headers[.mcpSessionID] else {
             return Self.error(.badRequest, "The Mcp-Session-Id header is required.")
         }
-        guard let session = await sessions.remove(sessionID) else { return Self.sessionNotFound }
+        guard let session = await sessions.remove(sessionID, profileID: profileID) else { return Self.sessionNotFound }
         await session.close()
         return Response(status: .ok)
     }

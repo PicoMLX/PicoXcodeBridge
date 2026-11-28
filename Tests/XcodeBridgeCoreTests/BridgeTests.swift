@@ -550,13 +550,13 @@ func callBody(id: Int, tool: String, arguments: String = "{}", progressToken: St
 }
 
 /// Initializes a session and returns a client for it, with the child's process id.
-func initializedClient(_ bridge: TestBridge) async throws -> (Client, Int32) {
+func initializedClient(_ bridge: TestBridge, path: String = "/mcp") async throws -> (Client, Int32) {
     var client = Client(bridge)
-    let (response, events) = try await client.post(initializeBody)
+    let (response, events) = try await client.stream(initializeBody, path: path)
     client.sessionID = response.value(forHTTPHeaderField: "Mcp-Session-Id")
     #expect(client.sessionID?.isEmpty == false)
     let pid = Int32(serverInfo(try await events.allMessages().first)?["version"] as? String ?? "") ?? 0
-    #expect(try await client.data(initializedNotification).0.statusCode == 202)
+    #expect(try await client.data(initializedNotification, path: path).0.statusCode == 202)
     return (client, pid)
 }
 
@@ -614,4 +614,202 @@ func rawStatus(port: Int, _ request: String) async throws -> Int {
         let statusLine = String(decoding: buffer.prefix(max(count, 0)), as: UTF8.self)
         return statusLine.split(separator: " ").dropFirst().first.flatMap { Int($0) } ?? -1
     }.value
+}
+
+
+// MARK: - Locally configured MCP profiles
+
+@Suite struct ProfileConfigurationTests {
+    @Test func examplesAreOptInAndRoundTrip() throws {
+        let document = try JSONDecoder().decode(BridgeProfileConfiguration.self, from: BridgeProfileConfiguration.exampleData())
+        #expect(document.version == 1)
+        #expect(document.profiles.map(\.id) == ["bear", "proxyman"])
+        #expect(try document.validatedProfiles().isEmpty)
+        var enabled = document
+        enabled.profiles[0].isEnabled = true
+        #expect(try enabled.validatedProfiles().map(\.id) == ["bear"])
+    }
+
+    @Test func refusesReservedIDsRoutesAndInvalidCommands() throws {
+        for id in ["", "xcode", "../bear", "bear/other", "bear?x=1", "bear%2fother", "bear\n", String(repeating: "x", count: 65)] {
+            let profile = BridgeProfile(id: id, name: "Test", executable: "/usr/bin/true")
+            #expect(throws: BridgeProfileConfiguration.ValidationError.self) {
+                try BridgeProfileConfiguration(profiles: [profile]).validatedProfiles()
+            }
+        }
+        for executable in ["node", "~/node", "https://example.com/tool", "/bin/test\0"] {
+            let profile = BridgeProfile(id: "test", name: "Test", executable: executable)
+            #expect(throws: BridgeProfileConfiguration.ValidationError.self) {
+                try BridgeProfileConfiguration(profiles: [profile]).validatedProfiles()
+            }
+        }
+        let duplicate = BridgeProfile(id: "test", name: "Test", executable: "/usr/bin/true")
+        #expect(throws: BridgeProfileConfiguration.ValidationError.self) {
+            try BridgeProfileConfiguration(profiles: [duplicate, duplicate]).validatedProfiles()
+        }
+        #expect(throws: BridgeProfileConfiguration.ValidationError.self) {
+            try BridgeProfileConfiguration(version: 2).validatedProfiles()
+        }
+    }
+
+    @Test func discoveryPublishesOnlyEnabledProfilesAndTracksTokenAndStatus() throws {
+        let suite = "MCPProfileTests.\(UUID().uuidString)"
+        defer { UserDefaults.standard.removePersistentDomain(forName: suite) }
+        let discovery = Discovery(suiteName: suite)
+        discovery.publish(port: 7431)
+        discovery.publish(status: .running)
+        let enabled = BridgeProfile(id: "test", name: "Test", executable: "/private/secret", environment: ["SECRET": "private"])
+        discovery.publish(profiles: [enabled] + BridgeProfile.examples)
+        func manifest() throws -> Discovery.Manifest {
+            try JSONDecoder().decode(Discovery.Manifest.self, from: #require(discovery.defaults.data(forKey: "mcpBridge.discovery")))
+        }
+        let first = try manifest()
+        #expect(first.version == 1)
+        #expect(first.port == 7431)
+        #expect(first.token == discovery.token())
+        #expect(first.status == .running)
+        #expect(first.profiles.map(\.id) == ["xcode", "test"])
+        #expect(first.profiles.map(\.path) == ["/mcp/xcode", "/mcp/test"])
+        let raw = string(try #require(discovery.defaults.data(forKey: "mcpBridge.discovery")))
+        #expect(!raw.contains("/private/secret"))
+        #expect(!raw.contains("SECRET"))
+        let nextToken = discovery.resetToken()
+        #expect(try manifest().token == nextToken)
+        #expect(nextToken != first.token)
+        discovery.publish(port: 7432)
+        #expect(try manifest().port == 7432)
+        discovery.publish(status: .stopped)
+        #expect(try manifest().status == .stopped)
+        #expect(discovery.defaults.string(forKey: "xcodeBridge.status") == "stopped")
+        #expect(discovery.defaults.string(forKey: "xcodeBridge.token") == nextToken)
+    }
+}
+
+@Suite(.timeLimit(.minutes(1)))
+struct ProfileRoutingTests {
+    private var profiles: [BridgeProfile] {
+        [
+            BridgeProfile(id: "bear", name: "Bear", executable: Fixtures.fakeServer.path,
+                          arguments: ["bear-argument"], environment: ["PROFILE_MARKER": "bear"]),
+            BridgeProfile(id: "proxyman", name: "Proxyman", executable: Fixtures.fakeServer.path,
+                          arguments: ["proxyman-argument"], environment: ["PROFILE_MARKER": "proxyman"]),
+            BridgeProfile(id: "disabled", name: "Disabled", executable: Fixtures.fakeServer.path, isEnabled: false),
+        ]
+    }
+
+    @Test func routesEachProfileAndKeepsLegacyXcodeEndpoint() async throws {
+        try await withBridge(configure: { $0.profiles = profiles }) { bridge in
+            for (path, argument, marker) in [("/mcp", "", ""), ("/mcp/xcode", "", ""),
+                                             ("/mcp/bear", "bear-argument", "bear"),
+                                             ("/mcp/proxyman", "proxyman-argument", "proxyman")] {
+                let (client, pid) = try await initializedClient(bridge, path: path)
+                #expect(pid > 0)
+                let (_, events) = try await client.stream(callBody(id: 2, tool: "identity"), path: path)
+                let identity = try #require(text(try await events.allMessages().first))
+                let object = try #require(json(Data(identity.utf8)))
+                #expect(object["marker"] as? String == marker)
+                #expect(object["arguments"] as? [String] == (argument.isEmpty ? [] : [argument]))
+                #expect(try await client.data(nil, method: "DELETE", path: path).0.statusCode == 200)
+            }
+        }
+    }
+
+    @Test func preservesXcodesReplacementEnvironmentWhileProfilesInheritOverrides() async throws {
+        try await withBridge(configure: {
+            $0.childEnvironment = ["PROFILE_MARKER": "isolated-xcode"]
+            $0.profiles = profiles
+        }) { bridge in
+            for (path, expectedMarker, expectedPath) in [
+                ("/mcp", "isolated-xcode", ""),
+                ("/mcp/xcode", "isolated-xcode", ""),
+                ("/mcp/bear", "bear", ProcessInfo.processInfo.environment["PATH"] ?? ""),
+            ] {
+                let (client, _) = try await initializedClient(bridge, path: path)
+                let (_, events) = try await client.stream(callBody(id: 2, tool: "identity"), path: path)
+                let identity = try #require(text(try await events.allMessages().first))
+                let object = try #require(json(Data(identity.utf8)))
+                #expect(object["marker"] as? String == expectedMarker)
+                #expect(object["path"] as? String == expectedPath)
+                #expect(try await client.data(nil, method: "DELETE", path: path).0.statusCode == 200)
+            }
+        }
+    }
+
+    @Test func rejectsSessionIDsOnOtherProfilesForEveryMethod() async throws {
+        try await withBridge(configure: { $0.profiles = profiles }) { bridge in
+            let (client, pid) = try await initializedClient(bridge, path: "/mcp/bear")
+            let ping = #"{"jsonrpc":"2.0","id":2,"method":"ping"}"#
+            for path in ["/mcp", "/mcp/xcode", "/mcp/proxyman"] {
+                #expect(try await client.data(ping, path: path).0.statusCode == 404)
+                #expect(try await client.data(initializedNotification, path: path).0.statusCode == 404)
+                #expect(try await client.data(nil, method: "GET", path: path).0.statusCode == 404)
+                #expect(try await client.data(nil, method: "DELETE", path: path).0.statusCode == 404)
+            }
+            #expect(kill(pid, 0) == 0)
+            #expect(await bridge.server.sessionCount == 1)
+            #expect(try await client.stream(ping, path: "/mcp/bear").0.statusCode == 200)
+            #expect(try await client.data(nil, method: "DELETE", path: "/mcp/bear").0.statusCode == 200)
+            #expect(await eventually { kill(pid, 0) != 0 })
+        }
+    }
+
+    @Test func unknownDisabledAndUnauthenticatedRoutesNeverLaunchChildren() async throws {
+        try await withBridge(configure: { $0.profiles = profiles }) { bridge in
+            var client = Client(bridge)
+            for path in ["/mcp/missing", "/mcp/disabled", "/mcp/bear/other", "/mcp/bear/", "/mcp//bear"] {
+                #expect(try await client.data(initializeBody, path: path).0.statusCode == 404)
+            }
+            client.token = nil
+            #expect(try await client.data(initializeBody, path: "/mcp/bear").0.statusCode == 401)
+            client.token = bridge.token
+            var request = client.request(initializeBody, method: "POST", path: "/mcp/bear")
+            request.setValue("http://localhost", forHTTPHeaderField: "Origin")
+            let (_, response) = try await Client.session.data(for: request)
+            #expect((response as? HTTPURLResponse)?.statusCode == 403)
+            #expect(await bridge.server.sessionCount == 0)
+        }
+    }
+
+    @Test func shutdownWaitsForChildrenThatIgnoreEOFAndSIGTERM() async throws {
+        var configuration = BridgeConfiguration(ports: [0])
+        configuration.childExecutable = Fixtures.fakeServer
+        configuration.childArguments = []
+        configuration.profiles = [BridgeProfile(id: "stubborn", name: "Stubborn", executable: Fixtures.fakeServer.path,
+                                                 arguments: ["--ignore-eof"])]
+        let bridge = try await TestBridge(configuration: configuration)
+        do {
+            let (client, pid) = try await initializedClient(bridge, path: "/mcp/stubborn")
+            // DELETE removes the session from the active map before the child has terminated.
+            // Application shutdown must drain these already-terminating children too.
+            #expect(try await client.data(nil, method: "DELETE", path: "/mcp/stubborn").0.statusCode == 200)
+            #expect(kill(pid, 0) == 0)
+            await bridge.stop()
+            #expect(kill(pid, 0) != 0)
+        } catch {
+            await bridge.stop()
+            throw error
+        }
+    }
+
+    @Test func resetAndShutdownEndChildrenFromAllProfiles() async throws {
+        let configurationProfiles = profiles
+        var configuration = BridgeConfiguration(ports: [0])
+        configuration.childExecutable = Fixtures.fakeServer
+        configuration.childArguments = []
+        configuration.profiles = configurationProfiles
+        let bridge = try await TestBridge(configuration: configuration)
+        do {
+            let (_, xcodePID) = try await initializedClient(bridge)
+            let (_, bearPID) = try await initializedClient(bridge, path: "/mcp/bear")
+            await bridge.server.resetToken(to: bridge.token)
+            #expect(await bridge.server.sessionCount == 0)
+            #expect(await eventually { kill(xcodePID, 0) != 0 && kill(bearPID, 0) != 0 })
+            let (_, nextPID) = try await initializedClient(bridge, path: "/mcp/proxyman")
+            await bridge.stop()
+            #expect(await eventually { kill(nextPID, 0) != 0 })
+        } catch {
+            await bridge.stop()
+            throw error
+        }
+    }
 }

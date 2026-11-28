@@ -21,9 +21,10 @@ public struct Discovery: @unchecked Sendable {
         public static let status = "xcodeBridge.status"
         public static let xcode = "xcodeBridge.xcode"
         public static let updatedAt = "xcodeBridge.updatedAt"
+        public static let manifest = "mcpBridge.discovery"
     }
 
-    public enum Status: String, Sendable {
+    public enum Status: String, Sendable, Codable {
         case running, stopped, failed
     }
 
@@ -49,6 +50,7 @@ public struct Discovery: @unchecked Sendable {
         let token = Self.makeToken()
         defaults.set(token, forKey: Key.token)
         touch()
+        refreshManifest()
         return token
     }
 
@@ -60,16 +62,61 @@ public struct Discovery: @unchecked Sendable {
     public func publish(port: Int) {
         defaults.set(port, forKey: Key.port)
         touch()
+        refreshManifest()
     }
 
     public func publish(status: Status) {
         defaults.set(status.rawValue, forKey: Key.status)
         touch()
+        refreshManifest()
     }
 
     public func publish(xcode: XcodeState) {
         defaults.set(xcode.rawValue, forKey: Key.xcode)
         touch()
+    }
+
+    /// The additional discovery contract. It contains only public profile metadata, never commands
+    /// or their environment. The token has the same app-group protection as the legacy token key.
+    public struct Manifest: Codable, Sendable, Equatable {
+        public struct Profile: Codable, Sendable, Equatable {
+            public let id: String
+            public let name: String
+            public let path: String
+        }
+
+        public var version = 1
+        public var port: Int
+        public var token: String
+        public var status: Status
+        public var profiles: [Profile]
+    }
+
+    /// Publish only the profiles this server actually routes. Xcode also keeps its legacy /mcp URL.
+    public func publish(profiles: [BridgeProfile]) {
+        guard let port = lastPort, (1...65535).contains(port) else { return }
+        let manifest = Manifest(port: port, token: token(),
+            status: defaults.string(forKey: Key.status).flatMap(Status.init(rawValue:)) ?? .stopped,
+            profiles: ([BridgeProfile.xcode] + profiles.filter(\.isEnabled)).map {
+                Manifest.Profile(id: $0.id, name: $0.name, path: $0.path)
+            })
+        write(manifest)
+    }
+
+    private func refreshManifest() {
+        guard let data = defaults.data(forKey: Key.manifest),
+              var manifest = try? JSONDecoder().decode(Manifest.self, from: data),
+              let port = lastPort, let token = defaults.string(forKey: Key.token), !token.isEmpty
+        else { return }
+        manifest.port = port
+        manifest.token = token
+        manifest.status = defaults.string(forKey: Key.status).flatMap(Status.init(rawValue:)) ?? .stopped
+        write(manifest)
+    }
+
+    private func write(_ manifest: Manifest) {
+        guard let data = try? JSONEncoder().encode(manifest) else { return }
+        defaults.set(data, forKey: Key.manifest)
     }
 
     private func touch() {
