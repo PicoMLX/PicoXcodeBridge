@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Used only with an embedded provisioning profile (Scripts/build-app.sh, PROVISIONING_PROFILE).
+	     The bridge isn't sandboxed: it launches xcrun mcpbridge. -->
+
+	<!-- Must match the profile, which is how macOS ties the profile to this signature. -->
+	<key>com.apple.application-identifier</key>
+	<string>TPKP4XK352.com.starlingprotocol.pico-xcode-bridge</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>TPKP4XK352</string>
+
+	<!-- Shares the port and token with Pico. A group. identifier is registered, so the profile
+	     must list it; see README.md, Signing. -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.starlingprotocol.pico</string>
+	</array>
+</dict>
+</plist>
